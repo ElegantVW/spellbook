@@ -1,0 +1,4 @@
+target/
+*.gguf
+*.so*
+.DS_Store
