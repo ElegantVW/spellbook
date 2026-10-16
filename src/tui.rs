@@ -1,5 +1,5 @@
 use crate::board;
-use crate::listing::{Listing, Sort};
+use crate::listing::{Kind, Listing, Sort};
 use crate::paths;
 use crossterm::{
     event::{
@@ -13,18 +13,25 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::border::{PLAIN, ROUNDED},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
-use std::io::{self, stdout};
+use std::io::{self, stdout, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const PINK: Color = Color::Rgb(0xe8, 0x79, 0xa0);
+const BLUSH: Color = Color::Rgb(0xf0, 0xb4, 0xc8);
 const DIM: Color = Color::Rgb(0x9d, 0x5c, 0x75);
 const FG: Color = Color::Rgb(0xff, 0xeb, 0xf2);
 const SILVER: Color = Color::Rgb(0xc0, 0xc0, 0xc8);
 const GOLD: Color = Color::Rgb(0xf0, 0xd8, 0xa0);
+const LILAC: Color = Color::Rgb(0xc4, 0xb0, 0xd8);
+const ROSE: Color = Color::Rgb(0xe8, 0xa0, 0xb4);
+const TEAL: Color = Color::Rgb(0x8e, 0xc4, 0xc8);
+const BLUSH_BG: Color = Color::Rgb(0x3a, 0x18, 0x24);
+const FOCUS_MS: u128 = 120;
+const SHELF_MS: u128 = 150;
 
 fn unicode() -> bool {
     match std::env::var("PIXIE_UNICODE") {
@@ -77,6 +84,12 @@ struct App {
     row_hits: Vec<(Rect, usize)>,
     path_hit: Option<Rect>,
     pending_editor: Option<PathBuf>,
+    hover: Option<usize>,
+    offset: usize,
+    focus_from: usize,
+    focus_t0: Instant,
+    shelf_t0: Option<Instant>,
+    anim_until: Instant,
 }
 
 impl App {
@@ -111,7 +124,32 @@ impl App {
             row_hits: Vec::new(),
             path_hit: None,
             pending_editor: None,
+            hover: None,
+            offset: 0,
+            focus_from: 0,
+            focus_t0: Instant::now(),
+            shelf_t0: None,
+            anim_until: Instant::now(),
         }
+    }
+
+    fn set_selected(&mut self, i: usize) {
+        let n = self.listing.entries.len();
+        if n == 0 {
+            self.selected = 0;
+            return;
+        }
+        let i = i.min(n - 1);
+        if i != self.selected {
+            self.focus_from = self.selected;
+            self.focus_t0 = Instant::now();
+            self.anim_until = Instant::now() + Duration::from_millis(FOCUS_MS as u64);
+            self.selected = i;
+        }
+    }
+
+    fn animating(&self) -> bool {
+        Instant::now() < self.anim_until
     }
 
     fn current(&self) -> Option<&crate::listing::Entry> {
@@ -140,6 +178,10 @@ impl App {
             .and_then(|n| n.to_str())
             .and_then(|n| self.listing.select_name(n))
             .unwrap_or(0);
+        self.offset = 0;
+        self.hover = None;
+        self.shelf_t0 = Some(Instant::now());
+        self.anim_until = Instant::now() + Duration::from_millis(SHELF_MS as u64);
         self.dirty = true;
     }
 }
@@ -157,11 +199,13 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
         event::EnableMouseCapture,
         event::EnableBracketedPaste
     )?;
+    let _ = write!(stdout, "\x1b[?1003h\x1b[?1006h");
+    let _ = stdout.flush();
     let mut term = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
     let _ = term.hide_cursor();
     let mut quit = false;
     loop {
-        if app.dirty {
+        if app.dirty || app.animating() {
             term.draw(|f| draw(f, &mut app))?;
             app.dirty = false;
         }
@@ -170,7 +214,12 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
             app.status = narrate(&format!("edit {}", path.display()), "the quill was dipped", true);
             app.reload();
         }
-        if event::poll(Duration::from_millis(250))? {
+        let wait = if app.animating() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        };
+        if event::poll(wait)? {
             match event::read()? {
                 Event::Key(k) => {
                     if handle_key(&mut app, k) {
@@ -180,7 +229,6 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
                 }
                 Event::Mouse(m) => {
                     handle_mouse(&mut app, m);
-                    app.dirty = true;
                 }
                 Event::Paste(s) => {
                     if matches!(app.mode, Mode::PathEdit) {
@@ -200,6 +248,7 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
         }
     }
     disable_raw_mode()?;
+    let _ = write!(io::stdout(), "\x1b[?1003l\x1b[?1006l");
     execute!(
         io::stdout(),
         LeaveAlternateScreen,
@@ -257,21 +306,21 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('j') | KeyCode::Down => {
             if !app.listing.entries.is_empty() && app.selected + 1 < app.listing.entries.len() {
-                app.selected += 1;
+                app.set_selected(app.selected + 1);
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.selected = app.selected.saturating_sub(1);
+            app.set_selected(app.selected.saturating_sub(1));
         }
         KeyCode::Char('l') if k.modifiers.contains(KeyModifiers::CONTROL) => begin_path(app),
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter | KeyCode::Char('o') => {
             open_selected(app);
         }
         KeyCode::Char('h') | KeyCode::Left => go_parent(app),
-        KeyCode::Char('g') => app.selected = 0,
+        KeyCode::Char('g') => app.set_selected(0),
         KeyCode::Char('G') => {
             if !app.listing.entries.is_empty() {
-                app.selected = app.listing.entries.len() - 1;
+                app.set_selected(app.listing.entries.len() - 1);
             }
         }
         KeyCode::Char('.') => {
@@ -582,19 +631,47 @@ fn do_delete(app: &mut App) {
 }
 
 fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
-    if matches!(app.mode, Mode::Help | Mode::ConfirmDelete | Mode::New | Mode::Rename) {
+    if m.modifiers.contains(KeyModifiers::SHIFT) {
+        return;
+    }
+    if matches!(app.mode, Mode::Help) {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.mode = Mode::Browse;
+            app.dirty = true;
+        }
+        return;
+    }
+    if matches!(app.mode, Mode::ConfirmDelete | Mode::New | Mode::Rename) {
         return;
     }
     match m.kind {
         MouseEventKind::ScrollUp => {
-            app.selected = app.selected.saturating_sub(1);
+            app.set_selected(app.selected.saturating_sub(1));
+            app.dirty = true;
         }
         MouseEventKind::ScrollDown => {
             if !app.listing.entries.is_empty() && app.selected + 1 < app.listing.entries.len() {
-                app.selected += 1;
+                app.set_selected(app.selected + 1);
+            }
+            app.dirty = true;
+        }
+        MouseEventKind::Moved => {
+            let col = m.column;
+            let row = m.row;
+            let mut h = None;
+            for (rect, idx) in &app.row_hits {
+                if hit(*rect, col, row) {
+                    h = Some(*idx);
+                    break;
+                }
+            }
+            if h != app.hover {
+                app.hover = h;
+                app.dirty = true;
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            app.dirty = true;
             let col = m.column;
             let row = m.row;
             if matches!(app.mode, Mode::PathEdit) {
@@ -627,7 +704,7 @@ fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
                         .last_click
                         .map(|(t, i)| i == idx && now.duration_since(t) < Duration::from_millis(350))
                         .unwrap_or(false);
-                    app.selected = idx;
+                    app.set_selected(idx);
                     app.last_click = Some((now, idx));
                     if dbl {
                         open_selected(app);
@@ -789,6 +866,50 @@ fn draw_header(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+fn kind_color(k: Kind) -> Color {
+    match k {
+        Kind::Dir => BLUSH,
+        Kind::Link => LILAC,
+        Kind::Exec => GOLD,
+        Kind::Image => ROSE,
+        Kind::Audio => TEAL,
+        Kind::Archive => DIM,
+        Kind::Code => SILVER,
+        Kind::Text => FG,
+    }
+}
+
+fn ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => Color::Rgb(
+            (ar as f32 + (br as f32 - ar as f32) * t) as u8,
+            (ag as f32 + (bg as f32 - ag as f32) * t) as u8,
+            (ab as f32 + (bb as f32 - ab as f32) * t) as u8,
+        ),
+        _ => b,
+    }
+}
+
+fn focus_t(app: &App) -> f32 {
+    ease(app.focus_t0.elapsed().as_millis() as f32 / FOCUS_MS as f32)
+}
+
+fn shelf_dim(app: &App) -> f32 {
+    match app.shelf_t0 {
+        Some(t0) => {
+            let t = ease(t0.elapsed().as_millis() as f32 / SHELF_MS as f32);
+            0.35 + 0.65 * t
+        }
+        None => 1.0,
+    }
+}
+
 fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
     let inner = Rect {
         x: area.x.saturating_add(1),
@@ -796,84 +917,105 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    let items: Vec<ListItem> = app
-        .listing
-        .entries
-        .iter()
-        .map(|e| {
-            let tag = if e.is_dir {
-                "[D]"
-            } else if e.is_link {
-                "[L]"
-            } else {
-                "[F]"
-            };
-            let name = if e.is_dir {
-                format!("{tag} {}/", e.name)
-            } else {
-                format!("{tag} {}", e.name)
-            };
-            let info = e.size_label();
-            let w = inner.width as usize;
-            let left = name;
-            let right = info;
-            let pad = w
-                .saturating_sub(left.chars().count())
-                .saturating_sub(right.chars().count());
-            let line = format!("{left}{}{right}", " ".repeat(pad));
-            ListItem::new(Line::from(Span::styled(line, Style::default().fg(FG))))
-        })
-        .collect();
-    let mut state = ListState::default();
-    if !app.listing.entries.is_empty() {
-        state.select(Some(app.selected));
-    }
-    let empty = app.listing.entries.is_empty();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(PINK))
         .border_set(border_set())
         .title(format!(" {} ", app.listing.dir.display()));
-    if empty {
+    f.render_widget(block, area);
+    if inner.width < 8 || inner.height == 0 {
+        return;
+    }
+    if app.listing.entries.is_empty() {
         let msg = app
             .listing
             .error
             .clone()
             .unwrap_or_else(|| "(empty shelf)".into());
         f.render_widget(
-            Paragraph::new(Span::styled(msg, Style::default().fg(DIM))).block(block),
-            area,
+            Paragraph::new(Span::styled(msg, Style::default().fg(DIM))),
+            inner,
         );
         return;
     }
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .fg(PINK)
-                .add_modifier(Modifier::REVERSED),
-        );
-    f.render_stateful_widget(list, area, &mut state);
     let vis = inner.height as usize;
-    let offset = state.offset();
-    for (i, _) in app.listing.entries.iter().enumerate() {
-        if i < offset {
-            continue;
-        }
-        let row = i - offset;
-        if row >= vis {
-            break;
-        }
+    if app.selected < app.offset {
+        app.offset = app.selected;
+    }
+    if app.selected >= app.offset + vis {
+        app.offset = app.selected + 1 - vis;
+    }
+    let dim = shelf_dim(app);
+    let ft = focus_t(app);
+    let mark_sel = if unicode() { "▸" } else { ">" };
+    let mark_hov = if unicode() { "·" } else { "." };
+    let mut lines: Vec<Line> = Vec::new();
+    for (row, i) in (app.offset..).take(vis).enumerate() {
+        let Some(e) = app.listing.entries.get(i) else { break };
+        let y = inner.y.saturating_add(row as u16);
         app.row_hits.push((
             Rect {
                 x: inner.x,
-                y: inner.y.saturating_add(row as u16),
+                y,
                 width: inner.width,
                 height: 1,
             },
             i,
         ));
+        let sel = i == app.selected;
+        let hov = app.hover == Some(i) && !sel;
+        let leaving = i == app.focus_from && !sel && ft < 1.0;
+        let focus = if sel {
+            ft
+        } else if leaving {
+            1.0 - ft
+        } else {
+            0.0
+        };
+        let gutter = if sel && focus > 0.4 {
+            mark_sel
+        } else if hov {
+            mark_hov
+        } else {
+            " "
+        };
+        let tag = e.kind.tag();
+        let shown = if e.is_dir {
+            format!("{tag} {}/", e.name)
+        } else {
+            format!("{tag} {}", e.name)
+        };
+        let info = e.size_label();
+        let w = inner.width as usize;
+        let gutter_s = format!("{gutter} ");
+        let pad = w
+            .saturating_sub(gutter_s.chars().count())
+            .saturating_sub(shown.chars().count())
+            .saturating_sub(info.chars().count());
+        let mut ink = kind_color(e.kind);
+        if dim < 0.99 {
+            ink = mix(Color::Rgb(0x1a, 0x0a, 0x12), ink, dim);
+        }
+        let mut name_style = Style::default().fg(ink);
+        if sel {
+            name_style = name_style
+                .fg(mix(ink, PINK, 0.35 * focus))
+                .bg(mix(Color::Rgb(0x1a, 0x0a, 0x12), BLUSH_BG, 0.55 * focus.max(0.25)))
+                .add_modifier(Modifier::BOLD);
+        } else if hov {
+            name_style = name_style.bg(Color::Rgb(0x28, 0x12, 0x1a));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                gutter_s,
+                Style::default().fg(if sel { PINK } else { DIM }),
+            ),
+            Span::styled(shown, name_style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(info, Style::default().fg(DIM)),
+        ]));
     }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
