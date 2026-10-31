@@ -1,4 +1,4 @@
-# Spellbook — terminal file manager ✨
+# Spellbook — the file shelf ✨
 
 Pink file shelf for faeOS. Rust engine, event-driven redraw (no 10 Hz Python paint).
 
