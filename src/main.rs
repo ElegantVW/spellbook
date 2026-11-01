@@ -1,5 +1,6 @@
 mod board;
 mod listing;
+mod overview;
 mod paths;
 mod tui;
 

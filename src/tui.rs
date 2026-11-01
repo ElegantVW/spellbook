@@ -13,7 +13,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::border::{PLAIN, ROUNDED},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::{self, stdout, Write};
@@ -90,6 +90,7 @@ struct App {
     focus_t0: Instant,
     shelf_t0: Option<Instant>,
     anim_until: Instant,
+    overview: bool,
 }
 
 impl App {
@@ -130,6 +131,7 @@ impl App {
             focus_t0: Instant::now(),
             shelf_t0: None,
             anim_until: Instant::now(),
+            overview: false,
         }
     }
 
@@ -341,6 +343,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
                 true,
             );
         }
+        KeyCode::Char('i') => app.overview = !app.overview,
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::Char(':') => begin_path(app),
         KeyCode::Char('y') => yank(app, false),
@@ -764,7 +767,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         )
     } else {
         format!(
-            " {} j/k · enter open · h parent · : path · n/d/r/e · . hidden · s sort · ?  ·  {} ",
+            " {} j/k · enter open · h parent · : path · i overview · n/d/r/e · . hidden · s sort · ?  ·  {} ",
             mark(),
             app.listing.sort.as_str()
         )
@@ -911,6 +914,23 @@ fn shelf_dim(app: &App) -> f32 {
 }
 
 fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
+    if app.overview {
+        if area.width >= 84 {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+                .split(area);
+            draw_file_list(f, panes[0], app);
+            draw_overview(f, panes[1], app);
+        } else {
+            draw_overview(f, area, app);
+        }
+    } else {
+        draw_file_list(f, area, app);
+    }
+}
+
+fn draw_file_list(f: &mut Frame, area: Rect, app: &mut App) {
     let inner = Rect {
         x: area.x.saturating_add(1),
         y: area.y.saturating_add(1),
@@ -1018,8 +1038,99 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
+    let Some(entry) = app.current() else {
+        f.render_widget(
+            Paragraph::new(
+                app.listing
+                    .error
+                    .as_deref()
+                    .unwrap_or("(no entry selected)"),
+            )
+            .style(Style::default().fg(DIM))
+            .block(
+                Block::default()
+                    .title(" Overview · i to close ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(PINK))
+                    .border_set(border_set()),
+            ),
+            area,
+        );
+        return;
+    };
+    let overview = crate::overview::inspect(entry);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Name  ", Style::default().fg(DIM)),
+            Span::styled(
+                overview.name,
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Type  ", Style::default().fg(DIM)),
+            Span::styled(overview.kind, Style::default().fg(BLUSH)),
+        ]),
+        Line::from(vec![
+            Span::styled("Size  ", Style::default().fg(DIM)),
+            Span::styled(overview.size, Style::default().fg(FG)),
+        ]),
+        Line::from(vec![
+            Span::styled("Changed  ", Style::default().fg(DIM)),
+            Span::styled(overview.modified, Style::default().fg(FG)),
+        ]),
+        Line::from(vec![
+            Span::styled("Mode  ", Style::default().fg(DIM)),
+            Span::styled(overview.permissions, Style::default().fg(FG)),
+        ]),
+        Line::from(Span::styled(
+            format!("Path  {}", overview.path),
+            Style::default().fg(SILVER),
+        )),
+        Line::from(Span::styled(
+            "Preview",
+            Style::default().fg(PINK).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    match overview.preview {
+        crate::overview::Preview::Text { content, truncated } => {
+            if content.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "(empty file)",
+                    Style::default().fg(DIM),
+                )));
+            } else {
+                lines.extend(content.lines().map(|line| {
+                    Line::from(Span::styled(line.to_string(), Style::default().fg(FG)))
+                }));
+                if truncated {
+                    lines.push(Line::from(Span::styled(
+                        format!("… preview limited to {} bytes", 4096),
+                        Style::default().fg(GOLD),
+                    )));
+                }
+            }
+        }
+        crate::overview::Preview::Message(message) => {
+            lines.push(Line::from(Span::styled(message, Style::default().fg(GOLD))));
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(" Overview · i to close ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(PINK))
+                .border_set(border_set()),
+        ),
+        area,
+    );
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
-    let t = "j/k move · enter/l/o open · h parent · : / ctrl-l path\n\
+    let t = "j/k move · enter/l/o open · h parent · : / ctrl-l path · i overview\n\
              y yank · Y yank shelf · P paste-go · . hidden · s sort\n\
              n new (name/ = dir) · d delete · r rename · e edit\n\
              mouse: click · double-open · wheel · click crumbs\n\
