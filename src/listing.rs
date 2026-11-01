@@ -38,8 +38,12 @@ pub enum Kind {
     Link,
     Exec,
     Image,
+    Video,
     Audio,
     Archive,
+    Markdown,
+    Markup,
+    Pdf,
     Code,
     Text,
 }
@@ -50,7 +54,15 @@ impl Kind {
             Kind::Dir => "[D]",
             Kind::Link => "[L]",
             Kind::Exec => "[x]",
-            _ => "[F]",
+            Kind::Image => "[I]",
+            Kind::Video => "[V]",
+            Kind::Audio => "[A]",
+            Kind::Archive => "[Z]",
+            Kind::Markdown => "[M]",
+            Kind::Markup => "[<]",
+            Kind::Pdf => "[P]",
+            Kind::Code => "[C]",
+            Kind::Text => "[F]",
         }
     }
 
@@ -66,12 +78,16 @@ impl Kind {
         }
         let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
         match ext.as_str() {
-            "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg" | "bmp" => Kind::Image,
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" => Kind::Image,
+            "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "mpg" | "mpeg" | "3gp" => Kind::Video,
             "flac" | "mp3" | "ogg" | "wav" | "m4a" | "opus" => Kind::Audio,
             "zip" | "tar" | "gz" | "tgz" | "7z" | "xz" | "bz2" | "rar" => Kind::Archive,
-            "rs" | "py" | "c" | "h" | "cc" | "hh" | "js" | "ts" | "tsx" | "jsx" | "go"
-            | "toml" | "json" | "yaml" | "yml" | "sh" | "zsh" | "bash" | "lua" | "rb"
-            | "java" | "kt" | "css" | "html" | "md" | "rsx" => Kind::Code,
+            "md" | "markdown" | "mdown" | "mkd" => Kind::Markdown,
+            "html" | "htm" | "xhtml" | "xml" | "svg" => Kind::Markup,
+            "pdf" => Kind::Pdf,
+            "rs" | "py" | "c" | "h" | "cc" | "hh" | "js" | "ts" | "tsx" | "jsx" | "go" | "toml"
+            | "json" | "yaml" | "yml" | "sh" | "zsh" | "bash" | "lua" | "rb" | "java" | "kt"
+            | "css" | "rsx" => Kind::Code,
             _ => Kind::Text,
         }
     }
@@ -238,5 +254,21 @@ mod tests {
         assert_eq!(Kind::from_name("notes", true, false, false), Kind::Dir);
         assert_eq!(Kind::from_name("bin", false, false, true), Kind::Exec);
         assert_eq!(Kind::from_name("link", false, true, false), Kind::Link);
+        assert_eq!(
+            Kind::from_name("clip.webm", false, false, false),
+            Kind::Video
+        );
+        assert_eq!(
+            Kind::from_name("guide.MD", false, false, false),
+            Kind::Markdown
+        );
+        assert_eq!(
+            Kind::from_name("page.HTML", false, false, false),
+            Kind::Markup
+        );
+        assert_eq!(
+            Kind::from_name("manual.pdf", false, false, false),
+            Kind::Pdf
+        );
     }
 }

@@ -3,6 +3,7 @@ mod listing;
 mod overview;
 mod paths;
 mod tui;
+mod video;
 
 use clap::Parser;
 use std::path::PathBuf;

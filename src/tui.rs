@@ -1,10 +1,10 @@
 use crate::board;
 use crate::listing::{Kind, Listing, Sort};
+use crate::overview::{ImagePreview, Overview, Preview};
 use crate::paths;
+use crate::video::VideoPlayer;
 use crossterm::{
-    event::{
-        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
-    },
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -49,7 +49,11 @@ fn border_set() -> ratatui::symbols::border::Set {
 }
 
 fn mark() -> &'static str {
-    if unicode() { "✦" } else { "*" }
+    if unicode() {
+        "✦"
+    } else {
+        "*"
+    }
 }
 
 fn narrate(cast: &str, answered: &str, ok: bool) -> String {
@@ -91,6 +95,11 @@ struct App {
     shelf_t0: Option<Instant>,
     anim_until: Instant,
     overview: bool,
+    overview_cache: Option<(usize, u16, u16, Overview)>,
+    video_player: Option<VideoPlayer>,
+    video_frame: Option<ImagePreview>,
+    video_last_frame: Instant,
+    preview_size: (u16, u16),
 }
 
 impl App {
@@ -132,6 +141,11 @@ impl App {
             shelf_t0: None,
             anim_until: Instant::now(),
             overview: false,
+            overview_cache: None,
+            video_player: None,
+            video_frame: None,
+            video_last_frame: Instant::now(),
+            preview_size: (48, 12),
         }
     }
 
@@ -143,6 +157,8 @@ impl App {
         }
         let i = i.min(n - 1);
         if i != self.selected {
+            self.stop_video();
+            self.overview_cache = None;
             self.focus_from = self.selected;
             self.focus_t0 = Instant::now();
             self.anim_until = Instant::now() + Duration::from_millis(FOCUS_MS as u64);
@@ -167,12 +183,16 @@ impl App {
     }
 
     fn reload(&mut self) {
+        self.stop_video();
+        self.overview_cache = None;
         self.listing.reload();
         self.clamp_sel();
         self.dirty = true;
     }
 
     fn goto_dir(&mut self, dir: PathBuf, select: Option<&Path>) {
+        self.stop_video();
+        self.overview_cache = None;
         self.listing.dir = dir;
         self.listing.reload();
         self.selected = select
@@ -184,6 +204,131 @@ impl App {
         self.hover = None;
         self.shelf_t0 = Some(Instant::now());
         self.anim_until = Instant::now() + Duration::from_millis(SHELF_MS as u64);
+        self.dirty = true;
+    }
+
+    fn stop_video(&mut self) {
+        self.video_player = None;
+        self.video_frame = None;
+    }
+
+    fn toggle_video(&mut self) {
+        if !self.ensure_video_player() {
+            return;
+        }
+        let result = self
+            .video_player
+            .as_mut()
+            .expect("player was opened above")
+            .toggle_pause();
+        match result {
+            Ok(()) => {
+                let player = self.video_player.as_ref().expect("player is active");
+                self.status = if player.is_paused() {
+                    "Video paused · v play · m mute · +/- volume".into()
+                } else {
+                    "Video playing · v pause · m mute · +/- volume".into()
+                };
+                self.video_last_frame = Instant::now();
+            }
+            Err(error) => {
+                self.stop_video();
+                self.status = format!("spellbook: mpv control failed: {error}");
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn ensure_video_player(&mut self) -> bool {
+        if self.video_player.is_none() {
+            let Some(entry) = self.current() else {
+                return false;
+            };
+            if entry.kind != Kind::Video {
+                return false;
+            }
+            match VideoPlayer::open(&entry.path) {
+                Ok(player) => self.video_player = Some(player),
+                Err(error) => {
+                    self.status = format!("spellbook: could not start mpv: {error}");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn toggle_video_mute(&mut self) {
+        if !self.ensure_video_player() {
+            return;
+        }
+        if let Some(player) = self.video_player.as_mut() {
+            match player.toggle_mute() {
+                Ok(()) => {
+                    self.status = if player.is_muted() {
+                        "Video muted".into()
+                    } else {
+                        "Video unmuted".into()
+                    };
+                }
+                Err(error) => {
+                    self.stop_video();
+                    self.status = format!("spellbook: mpv mute control failed: {error}");
+                }
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn adjust_video_volume(&mut self, delta: i16) {
+        if !self.ensure_video_player() {
+            return;
+        }
+        if let Some(player) = self.video_player.as_mut() {
+            match player.adjust_volume(delta) {
+                Ok(()) => {
+                    self.status = format!("Video volume: {}%", player.volume());
+                }
+                Err(error) => {
+                    self.stop_video();
+                    self.status = format!("spellbook: mpv volume control failed: {error}");
+                }
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn update_video(&mut self) {
+        let Some(player) = self.video_player.as_mut() else {
+            return;
+        };
+        if player.is_paused() || self.video_last_frame.elapsed() < Duration::from_millis(300) {
+            return;
+        }
+        let position = match player.position() {
+            Ok(position) => position,
+            Err(error) => {
+                self.stop_video();
+                self.status = format!("spellbook: mpv playback ended or failed: {error}");
+                self.dirty = true;
+                return;
+            }
+        };
+        let path = self.current().map(|entry| entry.path.clone());
+        let Some(path) = path else {
+            self.stop_video();
+            return;
+        };
+        match crate::overview::video_frame(
+            &path,
+            position,
+            self.preview_size.0,
+            self.preview_size.1,
+        ) {
+            Ok(frame) => self.video_frame = Some(frame),
+            Err(error) => self.status = error,
+        }
+        self.video_last_frame = Instant::now();
         self.dirty = true;
     }
 }
@@ -207,16 +352,26 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
     let _ = term.hide_cursor();
     let mut quit = false;
     loop {
+        app.update_video();
         if app.dirty || app.animating() {
             term.draw(|f| draw(f, &mut app))?;
             app.dirty = false;
         }
         if let Some(path) = app.pending_editor.take() {
             suspend_editor(&mut term, &path)?;
-            app.status = narrate(&format!("edit {}", path.display()), "the quill was dipped", true);
+            app.status = narrate(
+                &format!("edit {}", path.display()),
+                "the quill was dipped",
+                true,
+            );
             app.reload();
         }
-        let wait = if app.animating() {
+        let wait = if app.animating()
+            || app
+                .video_player
+                .as_ref()
+                .is_some_and(|player| !player.is_paused())
+        {
             Duration::from_millis(50)
         } else {
             Duration::from_millis(250)
@@ -227,6 +382,7 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
                     if handle_key(&mut app, k) {
                         quit = true;
                     }
+                    app.stop_video();
                     app.dirty = true;
                 }
                 Event::Mouse(m) => {
@@ -304,6 +460,27 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
         }
         Mode::Browse => {}
     }
+    if app.overview && app.current().is_some_and(|entry| entry.kind == Kind::Video) {
+        match k.code {
+            KeyCode::Char('v') | KeyCode::Char(' ') => {
+                app.toggle_video();
+                return false;
+            }
+            KeyCode::Char('m') => {
+                app.toggle_video_mute();
+                return false;
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                app.adjust_video_volume(5);
+                return false;
+            }
+            KeyCode::Char('-') => {
+                app.adjust_video_volume(-5);
+                return false;
+            }
+            _ => {}
+        }
+    }
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('j') | KeyCode::Down => {
@@ -343,7 +520,12 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
                 true,
             );
         }
-        KeyCode::Char('i') => app.overview = !app.overview,
+        KeyCode::Char('i') => {
+            app.overview = !app.overview;
+            if !app.overview {
+                app.stop_video();
+            }
+        }
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::Char(':') => begin_path(app),
         KeyCode::Char('y') => yank(app, false),
@@ -518,7 +700,9 @@ fn go_parent(app: &mut App) {
 }
 
 fn open_selected(app: &mut App) {
-    let Some(e) = app.current().cloned() else { return };
+    let Some(e) = app.current().cloned() else {
+        return;
+    };
     if e.is_dir {
         app.goto_dir(e.path, None);
         app.status = narrate(&format!("cd {}/", e.name), "a new path unfolds", true);
@@ -599,7 +783,9 @@ fn do_rename(app: &mut App) {
     if new_name.is_empty() {
         return;
     }
-    let Some(e) = app.current().cloned() else { return };
+    let Some(e) = app.current().cloned() else {
+        return;
+    };
     let dest = e.path.parent().unwrap_or(&app.listing.dir).join(&new_name);
     match std::fs::rename(&e.path, &dest) {
         Ok(()) => {
@@ -618,7 +804,9 @@ fn do_rename(app: &mut App) {
 }
 
 fn do_delete(app: &mut App) {
-    let Some(e) = app.current().cloned() else { return };
+    let Some(e) = app.current().cloned() else {
+        return;
+    };
     let r = if e.is_dir {
         std::fs::remove_dir_all(&e.path)
     } else {
@@ -627,7 +815,11 @@ fn do_delete(app: &mut App) {
     match r {
         Ok(()) => {
             app.reload();
-            app.status = narrate(&format!("delete {}", e.name), &format!("{} was unmade", e.name), true);
+            app.status = narrate(
+                &format!("delete {}", e.name),
+                &format!("{} was unmade", e.name),
+                true,
+            );
         }
         Err(err) => app.status = format!("spellbook: {err}"),
     }
@@ -705,7 +897,9 @@ fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
                     let now = Instant::now();
                     let dbl = app
                         .last_click
-                        .map(|(t, i)| i == idx && now.duration_since(t) < Duration::from_millis(350))
+                        .map(|(t, i)| {
+                            i == idx && now.duration_since(t) < Duration::from_millis(350)
+                        })
                         .unwrap_or(false);
                     app.set_selected(idx);
                     app.last_click = Some((now, idx));
@@ -751,10 +945,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         Mode::New => draw_prompt(f, chunks[2], " new · end with / for a dir ", &app.prompt),
         Mode::Rename => draw_prompt(f, chunks[2], " rename ", &app.prompt),
         Mode::ConfirmDelete => {
-            let name = app
-                .current()
-                .map(|e| e.name.as_str())
-                .unwrap_or("?");
+            let name = app.current().map(|e| e.name.as_str()).unwrap_or("?");
             draw_prompt(f, chunks[2], " delete ", &format!("{name}?  y / N"));
         }
         Mode::Browse => {}
@@ -778,7 +969,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         format!(" {} ", app.status)
     };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(footer, Style::default().fg(SILVER)))),
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(SILVER),
+        ))),
         chunks[3],
     );
 
@@ -875,8 +1069,12 @@ fn kind_color(k: Kind) -> Color {
         Kind::Link => LILAC,
         Kind::Exec => GOLD,
         Kind::Image => ROSE,
+        Kind::Video => Color::Rgb(0xa8, 0x9b, 0xe8),
         Kind::Audio => TEAL,
         Kind::Archive => DIM,
+        Kind::Markdown => Color::Rgb(0xe8, 0x79, 0xa0),
+        Kind::Markup => Color::Rgb(0x8e, 0xc4, 0xc8),
+        Kind::Pdf => Color::Rgb(0xf0, 0x8a, 0x70),
         Kind::Code => SILVER,
         Kind::Text => FG,
     }
@@ -971,7 +1169,9 @@ fn draw_file_list(f: &mut Frame, area: Rect, app: &mut App) {
     let mark_hov = if unicode() { "·" } else { "." };
     let mut lines: Vec<Line> = Vec::new();
     for (row, i) in (app.offset..).take(vis).enumerate() {
-        let Some(e) = app.listing.entries.get(i) else { break };
+        let Some(e) = app.listing.entries.get(i) else {
+            break;
+        };
         let y = inner.y.saturating_add(row as u16);
         app.row_hits.push((
             Rect {
@@ -1020,16 +1220,17 @@ fn draw_file_list(f: &mut Frame, area: Rect, app: &mut App) {
         if sel {
             name_style = name_style
                 .fg(mix(ink, PINK, 0.35 * focus))
-                .bg(mix(Color::Rgb(0x1a, 0x0a, 0x12), BLUSH_BG, 0.55 * focus.max(0.25)))
+                .bg(mix(
+                    Color::Rgb(0x1a, 0x0a, 0x12),
+                    BLUSH_BG,
+                    0.55 * focus.max(0.25),
+                ))
                 .add_modifier(Modifier::BOLD);
         } else if hov {
             name_style = name_style.bg(Color::Rgb(0x28, 0x12, 0x1a));
         }
         lines.push(Line::from(vec![
-            Span::styled(
-                gutter_s,
-                Style::default().fg(if sel { PINK } else { DIM }),
-            ),
+            Span::styled(gutter_s, Style::default().fg(if sel { PINK } else { DIM })),
             Span::styled(shown, name_style),
             Span::raw(" ".repeat(pad)),
             Span::styled(info, Style::default().fg(DIM)),
@@ -1038,8 +1239,8 @@ fn draw_file_list(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
-    let Some(entry) = app.current() else {
+fn draw_overview(f: &mut Frame, area: Rect, app: &mut App) {
+    if app.current().is_none() {
         f.render_widget(
             Paragraph::new(
                 app.listing
@@ -1050,7 +1251,7 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
             .style(Style::default().fg(DIM))
             .block(
                 Block::default()
-                    .title(" Overview · i to close ")
+                    .title(" Overview · i close · v play/pause · m mute · +/- volume ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(PINK))
                     .border_set(border_set()),
@@ -1059,12 +1260,30 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     };
-    let overview = crate::overview::inspect(entry);
+    let columns = area.width.saturating_sub(4).max(1);
+    let rows = area.height.saturating_sub(10).max(1);
+    app.preview_size = (columns, rows);
+    if !app
+        .overview_cache
+        .as_ref()
+        .is_some_and(|(selected, width, height, _)| {
+            *selected == app.selected && *width == columns && *height == rows
+        })
+    {
+        let entry = app.current().expect("selected entry still exists");
+        app.overview_cache = Some((
+            app.selected,
+            columns,
+            rows,
+            crate::overview::inspect(entry, columns, rows),
+        ));
+    }
+    let overview = &app.overview_cache.as_ref().expect("overview was cached").3;
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Name  ", Style::default().fg(DIM)),
             Span::styled(
-                overview.name,
+                overview.name.clone(),
                 Style::default().fg(FG).add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -1074,15 +1293,15 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("Size  ", Style::default().fg(DIM)),
-            Span::styled(overview.size, Style::default().fg(FG)),
+            Span::styled(overview.size.clone(), Style::default().fg(FG)),
         ]),
         Line::from(vec![
             Span::styled("Changed  ", Style::default().fg(DIM)),
-            Span::styled(overview.modified, Style::default().fg(FG)),
+            Span::styled(overview.modified.clone(), Style::default().fg(FG)),
         ]),
         Line::from(vec![
             Span::styled("Mode  ", Style::default().fg(DIM)),
-            Span::styled(overview.permissions, Style::default().fg(FG)),
+            Span::styled(overview.permissions.clone(), Style::default().fg(FG)),
         ]),
         Line::from(Span::styled(
             format!("Path  {}", overview.path),
@@ -1093,18 +1312,40 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(PINK).add_modifier(Modifier::BOLD),
         )),
     ];
-    match overview.preview {
-        crate::overview::Preview::Text { content, truncated } => {
+    if let Some(player) = app.video_player.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Video {} · {}% · mute {} · v play/pause · m mute · +/- volume",
+                if player.is_paused() {
+                    "paused"
+                } else {
+                    "playing"
+                },
+                player.volume(),
+                if player.is_muted() { "on" } else { "off" }
+            ),
+            Style::default().fg(TEAL),
+        )));
+    } else if overview.kind == "Video" {
+        lines.push(Line::from(Span::styled(
+            "Video paused · v play · m mute · +/- volume",
+            Style::default().fg(TEAL),
+        )));
+    }
+    match &overview.preview {
+        Preview::Text {
+            content,
+            truncated,
+            format,
+        } => {
             if content.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "(empty file)",
                     Style::default().fg(DIM),
                 )));
             } else {
-                lines.extend(content.lines().map(|line| {
-                    Line::from(Span::styled(line.to_string(), Style::default().fg(FG)))
-                }));
-                if truncated {
+                lines.extend(crate::overview::formatted_text(content, *format));
+                if *truncated {
                     lines.push(Line::from(Span::styled(
                         format!("… preview limited to {} bytes", 4096),
                         Style::default().fg(GOLD),
@@ -1112,15 +1353,22 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
                 }
             }
         }
-        crate::overview::Preview::Message(message) => {
-            lines.push(Line::from(Span::styled(message, Style::default().fg(GOLD))));
+        Preview::Image(image) | Preview::Video(image) => {
+            let frame = app.video_frame.as_ref().unwrap_or(image);
+            lines.extend(frame.lines());
+        }
+        Preview::Message(message) => {
+            lines.push(Line::from(Span::styled(
+                message.clone(),
+                Style::default().fg(GOLD),
+            )));
         }
     }
 
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title(" Overview · i to close ")
+                .title(" Overview · i close · v play/pause · m mute · +/- volume ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(PINK))
                 .border_set(border_set()),
