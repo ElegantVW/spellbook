@@ -1,9 +1,10 @@
 use crate::board;
 use crate::listing::{Kind, Listing, Sort};
-use crate::overview::{ImagePreview, Overview, Preview};
+use crate::overview::{Overview, Preview};
 use crate::paths;
 use crate::video::VideoPlayer;
 use crossterm::{
+    cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -95,11 +96,15 @@ struct App {
     shelf_t0: Option<Instant>,
     anim_until: Instant,
     overview: bool,
-    overview_cache: Option<(usize, u16, u16, Overview)>,
+    media_fullscreen: bool,
+    overview_cache: Option<(usize, Overview)>,
     video_player: Option<VideoPlayer>,
-    video_frame: Option<ImagePreview>,
+    video_frame: Option<crate::overview::ImagePreview>,
     video_last_frame: Instant,
-    preview_size: (u16, u16),
+    kitty_graphics: bool,
+    pending_image: Option<(Rect, Vec<u8>)>,
+    active_image_id: Option<u32>,
+    next_image_id: u32,
 }
 
 impl App {
@@ -141,11 +146,15 @@ impl App {
             shelf_t0: None,
             anim_until: Instant::now(),
             overview: false,
+            media_fullscreen: false,
             overview_cache: None,
             video_player: None,
             video_frame: None,
             video_last_frame: Instant::now(),
-            preview_size: (48, 12),
+            kitty_graphics: kitty_graphics_supported(),
+            pending_image: None,
+            active_image_id: None,
+            next_image_id: std::process::id().wrapping_mul(65_537).max(1),
         }
     }
 
@@ -163,6 +172,12 @@ impl App {
             self.focus_t0 = Instant::now();
             self.anim_until = Instant::now() + Duration::from_millis(FOCUS_MS as u64);
             self.selected = i;
+            if !self
+                .current()
+                .is_some_and(|entry| matches!(entry.kind, Kind::Image | Kind::Video))
+            {
+                self.media_fullscreen = false;
+            }
         }
     }
 
@@ -187,12 +202,19 @@ impl App {
         self.overview_cache = None;
         self.listing.reload();
         self.clamp_sel();
+        if !self
+            .current()
+            .is_some_and(|entry| matches!(entry.kind, Kind::Image | Kind::Video))
+        {
+            self.media_fullscreen = false;
+        }
         self.dirty = true;
     }
 
     fn goto_dir(&mut self, dir: PathBuf, select: Option<&Path>) {
         self.stop_video();
         self.overview_cache = None;
+        self.media_fullscreen = false;
         self.listing.dir = dir;
         self.listing.reload();
         self.selected = select
@@ -210,6 +232,21 @@ impl App {
     fn stop_video(&mut self) {
         self.video_player = None;
         self.video_frame = None;
+    }
+
+    fn ensure_overview(&mut self) {
+        if self
+            .overview_cache
+            .as_ref()
+            .is_some_and(|(selected, _)| *selected == self.selected)
+        {
+            return;
+        }
+        let Some(entry) = self.current().cloned() else {
+            self.overview_cache = None;
+            return;
+        };
+        self.overview_cache = Some((self.selected, crate::overview::inspect(&entry)));
     }
 
     fn toggle_video(&mut self) {
@@ -302,7 +339,7 @@ impl App {
         let Some(player) = self.video_player.as_mut() else {
             return;
         };
-        if player.is_paused() || self.video_last_frame.elapsed() < Duration::from_millis(300) {
+        if player.is_paused() || self.video_last_frame.elapsed() < Duration::from_millis(150) {
             return;
         }
         let position = match player.position() {
@@ -319,18 +356,87 @@ impl App {
             self.stop_video();
             return;
         };
-        match crate::overview::video_frame(
-            &path,
-            position,
-            self.preview_size.0,
-            self.preview_size.1,
-        ) {
+        match crate::overview::video_frame(&path, position) {
             Ok(frame) => self.video_frame = Some(frame),
             Err(error) => self.status = error,
         }
         self.video_last_frame = Instant::now();
         self.dirty = true;
     }
+
+    fn render_pending_image(&mut self) -> io::Result<()> {
+        let pending = self.pending_image.take();
+        if !self.kitty_graphics {
+            self.active_image_id = None;
+            return Ok(());
+        }
+        let mut output = io::stdout().lock();
+        if let Some(id) = self.active_image_id.take() {
+            write!(output, "\x1b_Ga=d,d=i,i={id},q=2\x1b\\")?;
+        }
+        if let Some((area, png)) = pending {
+            if area.width == 0 || area.height == 0 {
+                return output.flush();
+            }
+            let id = self.next_image_id;
+            self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+            execute!(output, MoveTo(area.x, area.y))?;
+            output.write_all(&kitty_image_commands(&png, id, area.width, area.height))?;
+            output.flush()?;
+            self.active_image_id = Some(id);
+        } else {
+            output.flush()?;
+        }
+        Ok(())
+    }
+}
+
+fn kitty_graphics_supported() -> bool {
+    std::env::var("TERM").is_ok_and(|term| term == "xterm-kitty" || term.ends_with("-kitty"))
+        || std::env::var_os("KITTY_WINDOW_ID").is_some()
+}
+
+fn kitty_image_commands(png: &[u8], id: u32, columns: u16, rows: u16) -> Vec<u8> {
+    let encoded = base64(png);
+    let chunks: Vec<_> = encoded.as_bytes().chunks(4096).collect();
+    let mut commands = Vec::with_capacity(encoded.len() + chunks.len() * 64);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let more = usize::from(index + 1 < chunks.len());
+        if index == 0 {
+            commands.extend_from_slice(
+                format!("\x1b_Ga=T,f=100,i={id},p={id},c={columns},r={rows},z=0,C=1,q=2,m={more};")
+                    .as_bytes(),
+            );
+        } else {
+            commands.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
+        }
+        commands.extend_from_slice(chunk);
+        commands.extend_from_slice(b"\x1b\\");
+    }
+    commands
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(TABLE[(a >> 2) as usize] as char);
+        encoded.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            TABLE[(c & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    encoded
 }
 
 pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Result<()> {
@@ -354,10 +460,14 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
     loop {
         app.update_video();
         if app.dirty || app.animating() {
+            app.pending_image = None;
             term.draw(|f| draw(f, &mut app))?;
+            app.render_pending_image()?;
             app.dirty = false;
         }
         if let Some(path) = app.pending_editor.take() {
+            app.pending_image = None;
+            app.render_pending_image()?;
             suspend_editor(&mut term, &path)?;
             app.status = narrate(
                 &format!("edit {}", path.display()),
@@ -382,7 +492,6 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
                     if handle_key(&mut app, k) {
                         quit = true;
                     }
-                    app.stop_video();
                     app.dirty = true;
                 }
                 Event::Mouse(m) => {
@@ -405,6 +514,9 @@ pub fn run(start: PathBuf, pick: bool, output: Option<PathBuf>) -> anyhow::Resul
             break;
         }
     }
+    app.pending_image = None;
+    app.render_pending_image()?;
+    app.stop_video();
     disable_raw_mode()?;
     let _ = write!(io::stdout(), "\x1b[?1003l\x1b[?1006l");
     execute!(
@@ -459,6 +571,15 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
             return false;
         }
         Mode::Browse => {}
+    }
+    let media_selected = app
+        .current()
+        .is_some_and(|entry| matches!(entry.kind, Kind::Image | Kind::Video));
+    if media_selected && k.code == KeyCode::Char('f') {
+        app.overview = true;
+        app.media_fullscreen = !app.media_fullscreen;
+        app.overview_cache = None;
+        return false;
     }
     if app.overview && app.current().is_some_and(|entry| entry.kind == Kind::Video) {
         match k.code {
@@ -524,6 +645,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> bool {
             app.overview = !app.overview;
             if !app.overview {
                 app.stop_video();
+                app.media_fullscreen = false;
             }
         }
         KeyCode::Char('?') => app.mode = Mode::Help,
@@ -1112,6 +1234,10 @@ fn shelf_dim(app: &App) -> f32 {
 }
 
 fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
+    if app.media_fullscreen {
+        draw_full_media_preview(f, area, app);
+        return;
+    }
     if app.overview {
         if area.width >= 84 {
             let panes = Layout::default()
@@ -1251,7 +1377,7 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &mut App) {
             .style(Style::default().fg(DIM))
             .block(
                 Block::default()
-                    .title(" Overview · i close · v play/pause · m mute · +/- volume ")
+                    .title(" Overview · f full · i close · v play/pause · m mute · +/- volume ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(PINK))
                     .border_set(border_set()),
@@ -1259,26 +1385,9 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &mut App) {
             area,
         );
         return;
-    };
-    let columns = area.width.saturating_sub(4).max(1);
-    let rows = area.height.saturating_sub(10).max(1);
-    app.preview_size = (columns, rows);
-    if !app
-        .overview_cache
-        .as_ref()
-        .is_some_and(|(selected, width, height, _)| {
-            *selected == app.selected && *width == columns && *height == rows
-        })
-    {
-        let entry = app.current().expect("selected entry still exists");
-        app.overview_cache = Some((
-            app.selected,
-            columns,
-            rows,
-            crate::overview::inspect(entry, columns, rows),
-        ));
     }
-    let overview = &app.overview_cache.as_ref().expect("overview was cached").3;
+    app.ensure_overview();
+    let overview = &app.overview_cache.as_ref().expect("overview was cached").1;
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Name  ", Style::default().fg(DIM)),
@@ -1312,6 +1421,16 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &mut App) {
             Style::default().fg(PINK).add_modifier(Modifier::BOLD),
         )),
     ];
+    let dimensions = match &overview.preview {
+        Preview::Image(image) | Preview::Video(image) => Some((image.width, image.height)),
+        _ => None,
+    };
+    if let Some((width, height)) = dimensions {
+        lines.push(Line::from(Span::styled(
+            format!("Resolution  {width} × {height}"),
+            Style::default().fg(SILVER),
+        )));
+    }
     if let Some(player) = app.video_player.as_ref() {
         lines.push(Line::from(Span::styled(
             format!(
@@ -1354,8 +1473,22 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &mut App) {
             }
         }
         Preview::Image(image) | Preview::Video(image) => {
-            let frame = app.video_frame.as_ref().unwrap_or(image);
-            lines.extend(frame.lines());
+            if app.kitty_graphics {
+                if let Some(viewport) = image_viewport(area, lines.len()) {
+                    let frame = app.video_frame.as_ref().unwrap_or(image);
+                    app.pending_image = Some((viewport, frame.png.clone()));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "Expand the pane to display media.",
+                        Style::default().fg(GOLD),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "Full-resolution preview requires Kitty graphics.",
+                    Style::default().fg(GOLD),
+                )));
+            }
         }
         Preview::Message(message) => {
             lines.push(Line::from(Span::styled(
@@ -1368,7 +1501,7 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title(" Overview · i close · v play/pause · m mute · +/- volume ")
+                .title(" Overview · f full · i close · v play/pause · m mute · +/- volume ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(PINK))
                 .border_set(border_set()),
@@ -1377,8 +1510,80 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+fn draw_full_media_preview(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(kind) = app.current().map(|entry| entry.kind) else {
+        return;
+    };
+    if !matches!(kind, Kind::Image | Kind::Video) {
+        app.media_fullscreen = false;
+        draw_file_list(f, area, app);
+        return;
+    }
+
+    app.ensure_overview();
+    let overview = &app.overview_cache.as_ref().expect("overview was cached").1;
+    let resolution = match &overview.preview {
+        Preview::Image(image) | Preview::Video(image) => {
+            format!("{} × {} ", image.width, image.height)
+        }
+        _ => String::new(),
+    };
+    let title = if overview.kind == "Video" {
+        format!(" Video {resolution}· f back · v play/pause · m mute · +/- volume · i close ")
+    } else {
+        format!(" Image {resolution}· f back · i close · {} ", overview.name)
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(PINK))
+        .border_set(border_set());
+    let viewport = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let mut message = None;
+    match &overview.preview {
+        Preview::Image(image) | Preview::Video(image) => {
+            if app.kitty_graphics && viewport.width > 0 && viewport.height > 0 {
+                let frame = app.video_frame.as_ref().unwrap_or(image);
+                app.pending_image = Some((viewport, frame.png.clone()));
+            } else if app.kitty_graphics {
+                message = Some("Terminal area is too small for an image preview.".to_string());
+            } else {
+                message = Some("Full-resolution preview requires Kitty graphics.".to_string());
+            }
+        }
+        Preview::Message(text) => message = Some(text.clone()),
+        Preview::Text { .. } => message = Some("No media preview is available.".into()),
+    }
+    let paragraph = Paragraph::new(message.unwrap_or_default())
+        .style(Style::default().fg(GOLD))
+        .block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn image_viewport(area: Rect, metadata_lines: usize) -> Option<Rect> {
+    let x = area.x.saturating_add(1);
+    let y = area
+        .y
+        .saturating_add(1)
+        .saturating_add(metadata_lines as u16);
+    let bottom = area.y.saturating_add(area.height).saturating_sub(1);
+    let viewport = Rect {
+        x,
+        y,
+        width: area.width.saturating_sub(2),
+        height: bottom.saturating_sub(y),
+    };
+    (viewport.width > 0 && viewport.height > 0).then_some(viewport)
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
-    let t = "j/k move · enter/l/o open · h parent · : / ctrl-l path · i overview\n\
+    let t = "j/k move · enter/l/o open · h parent · : / ctrl-l path · i overview · f media fit\n\
+             video: v play/pause · m mute · +/- volume\n\
              y yank · Y yank shelf · P paste-go · . hidden · s sort\n\
              n new (name/ = dir) · d delete · r rename · e edit\n\
              mouse: click · double-open · wheel · click crumbs\n\
@@ -1444,4 +1649,27 @@ fn suspend_editor<B: ratatui::backend::Backend>(
     )?;
     term.clear()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod kitty_tests {
+    use super::*;
+
+    #[test]
+    fn encodes_base64_with_standard_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn creates_chunked_full_resolution_kitty_image_commands() {
+        let png = vec![b'x'; 4000];
+        let commands = kitty_image_commands(&png, 42, 80, 24);
+        let commands = String::from_utf8(commands).expect("protocol is ASCII");
+        assert!(commands.starts_with("\u{1b}_Ga=T,f=100,i=42,p=42,c=80,r=24,z=0,C=1,q=2,m=1;"));
+        assert!(commands.contains("\u{1b}_Gm=0;"));
+        assert!(commands.ends_with("\u{1b}\\"));
+    }
 }

@@ -45,52 +45,31 @@ pub enum Preview {
 
 #[derive(Debug)]
 pub struct ImagePreview {
-    pub pixels: Vec<Vec<[u8; 3]>>,
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl ImagePreview {
-    fn from_image(image: image::DynamicImage, columns: u16, rows: u16) -> Self {
-        let columns = u32::from(columns.max(1)).min(80);
-        let pixel_rows = u32::from(rows.max(1)).saturating_mul(2).min(48);
-        let image = image.thumbnail(columns, pixel_rows).to_rgb8();
-        let left = (columns - image.width()) / 2;
-        let top = (pixel_rows - image.height()) / 2;
-        let mut pixels = vec![vec![[0, 0, 0]; columns as usize]; pixel_rows as usize];
-        for (x, y, pixel) in image.enumerate_pixels() {
-            pixels[(top + y) as usize][(left + x) as usize] = pixel.0;
+    fn from_image(image: image::DynamicImage) -> Result<Self, String> {
+        let width = image.width();
+        let height = image.height();
+        let mut png = Cursor::new(Vec::new());
+        image
+            .write_to(&mut png, image::ImageFormat::Png)
+            .map_err(|error| format!("Could not encode image preview: {error}"))?;
+        if png.get_ref().len() > IMAGE_FILE_LIMIT * 2 {
+            return Err("Rendered image exceeds the 64 MiB preview limit.".into());
         }
-        Self { pixels }
-    }
-
-    pub fn lines(&self) -> Vec<Line<'static>> {
-        self.pixels
-            .chunks(2)
-            .map(|pair| {
-                let top = &pair[0];
-                let bottom = pair.get(1);
-                Line::from(
-                    top.iter()
-                        .enumerate()
-                        .map(|(x, foreground)| {
-                            let background = bottom
-                                .and_then(|row| row.get(x))
-                                .copied()
-                                .unwrap_or([0, 0, 0]);
-                            Span::styled(
-                                "▀",
-                                Style::default()
-                                    .fg(Color::Rgb(foreground[0], foreground[1], foreground[2]))
-                                    .bg(Color::Rgb(background[0], background[1], background[2])),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect()
+        Ok(Self {
+            png: png.into_inner(),
+            width,
+            height,
+        })
     }
 }
 
-pub fn inspect(entry: &Entry, columns: u16, rows: u16) -> Overview {
+pub fn inspect(entry: &Entry) -> Overview {
     let path = entry.path.display().to_string();
     let metadata = match fs::symlink_metadata(&entry.path) {
         Ok(metadata) => metadata,
@@ -122,7 +101,7 @@ pub fn inspect(entry: &Entry, columns: u16, rows: u16) -> Overview {
     } else if !metadata.is_file() {
         Preview::Message("Special file; preview is disabled.".into())
     } else {
-        read_preview(&entry.path, kind, columns, rows)
+        read_preview(&entry.path, kind)
     };
 
     Overview {
@@ -143,10 +122,10 @@ pub fn inspect(entry: &Entry, columns: u16, rows: u16) -> Overview {
     }
 }
 
-fn read_preview(path: &Path, kind: Kind, columns: u16, rows: u16) -> Preview {
+fn read_preview(path: &Path, kind: Kind) -> Preview {
     match kind {
-        Kind::Image => return read_image(path, columns, rows, false),
-        Kind::Video => return read_image(path, columns, rows, true),
+        Kind::Image => return read_image(path, false),
+        Kind::Video => return read_image(path, true),
         Kind::Pdf => return read_pdf(path),
         _ => {}
     }
@@ -217,10 +196,10 @@ fn read_preview(path: &Path, kind: Kind, columns: u16, rows: u16) -> Preview {
     }
 }
 
-fn read_image(path: &Path, columns: u16, rows: u16, video: bool) -> Preview {
+fn read_image(path: &Path, video: bool) -> Preview {
     if video {
-        return match video_frame(path, 0.0, columns, rows) {
-            Ok(image) => Preview::Video(image),
+        return match video_frame(path, 0.0) {
+            Ok(frame) => Preview::Video(frame),
             Err(error) => Preview::Message(error),
         };
     }
@@ -261,7 +240,10 @@ fn read_image(path: &Path, columns: u16, rows: u16, video: bool) -> Preview {
     };
 
     match image {
-        Ok(image) => Preview::Image(ImagePreview::from_image(image, columns, rows)),
+        Ok(image) => match ImagePreview::from_image(image) {
+            Ok(preview) => Preview::Image(preview),
+            Err(error) => Preview::Message(error),
+        },
         Err(error) => Preview::Message(format!("Could not decode image preview: {error}")),
     }
 }
@@ -276,12 +258,7 @@ fn decode_image(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
     reader.decode()
 }
 
-pub fn video_frame(
-    path: &Path,
-    seconds: f64,
-    columns: u16,
-    rows: u16,
-) -> Result<ImagePreview, String> {
+pub fn video_frame(path: &Path, seconds: f64) -> Result<ImagePreview, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("Could not inspect video preview: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -296,7 +273,7 @@ pub fn video_frame(
             "-frames:v",
             "1",
             "-vf",
-            "scale=320:96:force_original_aspect_ratio=decrease",
+            "scale=w='min(iw,3840)':h='min(ih,2160)':force_original_aspect_ratio=decrease",
             "-f",
             "image2pipe",
             "-vcodec",
@@ -312,7 +289,7 @@ pub fn video_frame(
     }
     let image = decode_image(&output.stdout)
         .map_err(|error| format!("Could not decode video frame: {error}"))?;
-    Ok(ImagePreview::from_image(image, columns, rows))
+    ImagePreview::from_image(image)
 }
 
 fn read_pdf(path: &Path) -> Preview {
@@ -607,7 +584,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn inspect_entry(entry: &Entry) -> Overview {
-        inspect(entry, 32, 8)
+        inspect(entry)
     }
 
     struct Fixture(PathBuf);
@@ -724,13 +701,13 @@ mod tests {
         let fixture = Fixture::new();
         let missing = fixture.0.join("missing.txt");
         assert!(matches!(
-            read_preview(&missing, Kind::Text, 32, 8),
+            read_preview(&missing, Kind::Text),
             Preview::Message(message) if message.contains("Could not open preview")
         ));
     }
 
     #[test]
-    fn decodes_images_to_bounded_terminal_pixels() {
+    fn decodes_images_to_full_resolution_png() {
         let fixture = Fixture::new();
         let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
             160,
@@ -742,9 +719,11 @@ mod tests {
             .expect("save image fixture");
         match inspect_entry(&fixture.entry("picture.png")).preview {
             Preview::Image(preview) => {
-                assert_eq!(preview.pixels.len(), 16);
-                assert_eq!(preview.pixels[0].len(), 32);
-                assert_eq!(preview.pixels[7][15], [240, 20, 90]);
+                assert_eq!(preview.width, 160);
+                assert_eq!(preview.height, 80);
+                assert!(preview.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+                let decoded = image::load_from_memory(&preview.png).unwrap().to_rgb8();
+                assert_eq!(decoded.get_pixel(80, 40).0, [240, 20, 90]);
             }
             Preview::Message(message) => panic!("unexpected image preview message: {message}"),
             _ => panic!("expected image preview"),
@@ -837,8 +816,37 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
         #[cfg(unix)]
-        assert!(video_frame(&link, 0.0, 32, 8)
+        assert!(video_frame(&link, 0.0)
             .unwrap_err()
             .contains("regular files"));
+    }
+
+    #[test]
+    fn extracts_video_frames_at_the_source_resolution() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let fixture = Fixture::new();
+        let path = fixture.0.join("source.avi");
+        let output = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=640x360:r=10:d=1",
+                "-c:v",
+                "mpeg4",
+                "-y",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg is available");
+        assert!(output.status.success());
+
+        let frame = video_frame(&path, 0.0).expect("extract source frame");
+        assert_eq!((frame.width, frame.height), (640, 360));
     }
 }
